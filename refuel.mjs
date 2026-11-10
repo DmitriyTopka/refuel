@@ -11,7 +11,12 @@
 //                                           paid: quote-2.0 with gasless:true, then (with --yes) sign and submit
 //   fail-demo                               paid-path request with a broken mint: shows 4xx and that nothing is charged
 //
-// Env: PAYER_KEYPAIR (path to Solana keypair JSON, required), SOLANA_RPC_URL, HERMES_URL.
+// Env: PAYER_KEYPAIR (path to Solana keypair JSON, required), SOLANA_RPC_URL, HERMES_URL,
+//      MAX_PAY_ATOMIC (cap per x402 payment, default 10000 = $0.01), HERMES_PAY_TO, GASLESS_SPONSOR.
+//
+// Safety: every x402 payment is capped and must go to the pinned Swap.io payTo in USDC on Solana mainnet.
+// The swap transaction from the server is simulated on your own RPC before signing: it must be paid by the
+// Swap.io sponsor, take at most the requested USDC, leave your SOL and token accounts with you, no delegate.
 // Builds on the swap-dot-io/agent-skills hermes-swap plugin (same x402 client and receipt check),
 // adds gasless swaps, balance trigger and on-chain confirmation. The secret key is never printed.
 import { createX402Client } from 'x402-solana/client';
@@ -23,6 +28,11 @@ const RPC = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
 const USDC = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 const SOL = 'So11111111111111111111111111111111111111112';
 const LAMPORTS = 1e9;
+const DEFAULT_HERMES = 'https://hermes.swap.io';
+// pinned from https://hermes.swap.io/v1/info and the 402 answers seen on mainnet (Nov 2026)
+const PAY_TO = process.env.HERMES_PAY_TO || 'BPz2u6eoWLervxEqfpsMCVmKk7h6fEVsd7L5rvEibMfD';
+const SPONSOR = process.env.GASLESS_SPONSOR || 'E4BV2sQb7jMDpjfDqLNhCMqLTdSgq4Zcgszr9naUqRyC';
+const MAX_PAY = BigInt(process.env.MAX_PAY_ATOMIC || '10000');
 
 const [cmd, ...rest] = process.argv.slice(2);
 const args = {};
@@ -49,11 +59,64 @@ async function balances(pub) {
   return { sol: sol / LAMPORTS, usdc };
 }
 
+if (HERMES !== DEFAULT_HERMES && !process.env.HERMES_PAY_TO) {
+  console.error('ERROR: custom HERMES_URL needs HERMES_PAY_TO too, so payments cannot go to an unknown address'); process.exit(1);
+}
+
+// x402 payment policy: runs after the 402 is parsed and before anything is signed.
+function paymentPolicy(req, ctx) {
+  const no = (reason) => ({ abort: true, reason });
+  if (!ctx.requestUrl.startsWith(HERMES + '/')) return no(`unexpected URL ${ctx.requestUrl}`);
+  if (req.payTo !== PAY_TO) return no(`payTo ${req.payTo} is not the pinned Swap.io address`);
+  if (req.asset !== USDC) return no(`asset ${req.asset} is not USDC`);
+  if (!String(req.network).startsWith('solana') || String(req.network).includes('devnet')) return no(`network ${req.network} is not Solana mainnet`);
+  if (BigInt(req.amount) > MAX_PAY) return no(`price ${req.amount} is above the cap ${MAX_PAY}`);
+}
+
 function client(w) {
   return createX402Client({
     wallet: { address: w.publicKey.toString(), signTransaction: async (t) => { t.sign([w]); return t; } },
-    network: 'solana', rpcUrl: RPC,
+    network: 'solana', rpcUrl: RPC, amount: MAX_PAY, beforePayment: paymentPolicy,
   });
+}
+
+// SPL token account layout: mint 0..32, owner 32..64, amount 64..72, delegate option 72..76
+function tokenState(b64) {
+  if (!b64) return null;
+  const d = Buffer.from(b64, 'base64');
+  if (d.length < 76) return null;
+  return { owner: new PublicKey(d.subarray(32, 64)).toString(), amount: d.readBigUInt64LE(64), delegated: d.readUInt32LE(72) !== 0 };
+}
+
+// Check the server-built swap before signing it. Throws with a reason if anything looks wrong.
+async function verifySwap(t, me, maxUsdcAtomic) {
+  const feePayer = t.message.staticAccountKeys[0].toString();
+  if (feePayer === me) throw new Error('fee payer is our wallet, not the gasless sponsor');
+  if (feePayer !== SPONSOR) throw new Error(`fee payer ${feePayer} is not the pinned Swap.io sponsor`);
+  const pub = new PublicKey(me);
+  const tokenAccs = (await conn.getTokenAccountsByOwner(pub, { programId: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA') })).value;
+  const addrs = [me, ...tokenAccs.map((a) => a.pubkey.toString())];
+  const pre = Object.fromEntries(tokenAccs.map((a) => [a.pubkey.toString(), tokenState(Buffer.from(a.account.data).toString('base64'))]));
+  const preSol = await conn.getBalance(pub);
+  const sim = await conn.simulateTransaction(t, { sigVerify: false, replaceRecentBlockhash: true, accounts: { addresses: addrs, encoding: 'base64' } });
+  if (sim.value.err) throw new Error(`own RPC simulation failed: ${JSON.stringify(sim.value.err)}`);
+  const post = sim.value.accounts;
+  if ((post[0]?.lamports ?? 0) < preSol) throw new Error('the swap would take SOL from the wallet');
+  if (post[0] && post[0].owner !== '11111111111111111111111111111111') throw new Error('the swap would reassign the wallet account');
+  let usdcOut = 0n;
+  addrs.slice(1).forEach((a, i) => {
+    const after = tokenState(post[i + 1]?.data?.[0]); const before = pre[a];
+    if (!after) throw new Error(`the swap would close token account ${a}`);
+    if (after.owner !== me) throw new Error(`the swap would change the owner of token account ${a}`);
+    if (after.delegated) throw new Error(`the swap would set a delegate on token account ${a}`);
+    const mint = tokenAccs[i].account.data.subarray(0, 32);
+    if (after.amount < before.amount) {
+      if (new PublicKey(mint).toString() !== USDC) throw new Error(`the swap would take a non-USDC token from ${a}`);
+      usdcOut += before.amount - after.amount;
+    }
+  });
+  if (usdcOut > maxUsdcAtomic) throw new Error(`the swap would take ${usdcOut} atomic USDC, asked for ${maxUsdcAtomic}`);
+  return { usdcOut, solGain: ((post[0]?.lamports ?? 0) - preSol) / LAMPORTS };
 }
 
 // Paid POST: trust a 200 only with a successful settlement receipt (X-PAYMENT-RESPONSE).
@@ -113,9 +176,10 @@ async function main() {
     if (!best?.simulation?.transaction) fail('no provider returned a simulated transaction');
     if (!best.simulation.gasless?.enabled) fail('gasless is not available for this swap (Swap.io needs SOL < 0.01 and at least $2)');
     say(`best route: ${best.provider.key}, ${best.simulation.primaryOutput.amountFormatted} SOL, network fee sponsored by ${best.simulation.gasless.feePayer}`);
-    if (!args.yes) { say('dry run: add --yes to sign and send'); return; }
-
     const t = VersionedTransaction.deserialize(Buffer.from(best.simulation.transaction, 'base64'));
+    const v = await verifySwap(t, me, BigInt(Math.round(usdcIn * 1e6)));
+    console.error(`checked on own RPC: takes ${Number(v.usdcOut) / 1e6} USDC, adds ${v.solGain} SOL, fee paid by sponsor`);
+    if (!args.yes) { say('dry run: add --yes to sign and send'); return; }
     t.sign([w]);
     const s = await paid(c, '/v1/swap/submit-tx', {
       signedTransaction: Buffer.from(t.serialize()).toString('base64'), provider: best.provider.key, chainKey: 'sol',

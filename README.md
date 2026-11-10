@@ -28,12 +28,20 @@ See `skills/refuel/SKILL.md` for commands and agent rules. Built on top of the [
 
 `dev/reset.mjs` is a test helper that puts the wallet back to 0 SOL; it is not part of the skill.
 
+## Safety
+
+The skill holds a real key, so it does not trust the server blindly:
+- Every x402 payment is capped (`MAX_PAY_ATOMIC`, default 10000 = $0.01) and must go to the pinned Swap.io `payTo`, in USDC, on Solana mainnet. Otherwise the payment is refused before anything is signed.
+- A custom `HERMES_URL` is refused unless you also pin its `HERMES_PAY_TO`.
+- Before signing the swap, the script simulates it on your own RPC and refuses it unless the fee payer is the pinned Swap.io sponsor, the wallet loses at most the requested USDC and no SOL, and no token account gets closed, re-owned or delegated.
+
 ## Known limits
 
 - Solana mainnet only. The wallet needs a few USDC to start.
 - Swap.io sponsors the swap fee only when the wallet has under 0.01 SOL and the swap is worth $2 or more, so the default is 2.5 USDC.
 - The keypair is a local file. Keep it out of the repo (`.gitignore` covers `*keypair*.json`).
 - Quotes live for a short time, so the skill signs and sends right after paying.
+- The pre-sign check covers classic SPL token accounts. Use a dedicated wallet that holds only USDC for the bot.
 
 ## How it was built
 
