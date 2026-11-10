@@ -80,21 +80,30 @@ function client(w) {
   });
 }
 
-// SPL token account layout: mint 0..32, owner 32..64, amount 64..72, delegate option 72..76
+// SPL token account base layout (same for Token and Token-2022): mint 0..32, owner 32..64, amount 64..72,
+// delegate option 72..108, state 108, isNative option 109..121, delegatedAmount 121..129, closeAuthority option 129..165
 function tokenState(b64) {
   if (!b64) return null;
   const d = Buffer.from(b64, 'base64');
-  if (d.length < 76) return null;
-  return { owner: new PublicKey(d.subarray(32, 64)).toString(), amount: d.readBigUInt64LE(64), delegated: d.readUInt32LE(72) !== 0 };
+  if (d.length < 165) return null;
+  const closeAuth = d.readUInt32LE(129) !== 0 ? new PublicKey(d.subarray(133, 165)).toString() : null;
+  return { mint: new PublicKey(d.subarray(0, 32)).toString(), owner: new PublicKey(d.subarray(32, 64)).toString(),
+    amount: d.readBigUInt64LE(64), delegated: d.readUInt32LE(72) !== 0, state: d[108], closeAuth };
 }
+const TOKEN_PROGRAMS = ['TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb'];
 
 // Check the server-built swap before signing it. Throws with a reason if anything looks wrong.
-async function verifySwap(t, me, maxUsdcAtomic) {
-  const feePayer = t.message.staticAccountKeys[0].toString();
+async function verifySwap(t, me, maxUsdcAtomic, minSolLamports) {
+  const keys = t.message.staticAccountKeys;
+  const feePayer = keys[0].toString();
   if (feePayer === me) throw new Error('fee payer is our wallet, not the gasless sponsor');
   if (feePayer !== SPONSOR) throw new Error(`fee payer ${feePayer} is not the pinned Swap.io sponsor`);
+  // a durable nonce would let the transaction run later than the simulation we check; the swap must use a normal blockhash
+  const first = t.message.compiledInstructions[0];
+  if (first && keys[first.programIdIndex]?.toString() === '11111111111111111111111111111111' && first.data.length >= 4 && Buffer.from(first.data).readUInt32LE(0) === 4)
+    throw new Error('the swap uses a durable nonce');
   const pub = new PublicKey(me);
-  const tokenAccs = (await conn.getTokenAccountsByOwner(pub, { programId: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA') })).value;
+  const tokenAccs = (await Promise.all(TOKEN_PROGRAMS.map((id) => conn.getTokenAccountsByOwner(pub, { programId: new PublicKey(id) })))).flatMap((r) => r.value);
   const addrs = [me, ...tokenAccs.map((a) => a.pubkey.toString())];
   const pre = Object.fromEntries(tokenAccs.map((a) => [a.pubkey.toString(), tokenState(Buffer.from(a.account.data).toString('base64'))]));
   const preSol = await conn.getBalance(pub);
@@ -109,13 +118,16 @@ async function verifySwap(t, me, maxUsdcAtomic) {
     if (!after) throw new Error(`the swap would close token account ${a}`);
     if (after.owner !== me) throw new Error(`the swap would change the owner of token account ${a}`);
     if (after.delegated) throw new Error(`the swap would set a delegate on token account ${a}`);
-    const mint = tokenAccs[i].account.data.subarray(0, 32);
+    if (after.state !== before.state) throw new Error(`the swap would freeze or change the state of token account ${a}`);
+    if (after.closeAuth !== before.closeAuth && after.closeAuth !== me) throw new Error(`the swap would give the close authority of ${a} to someone else`);
     if (after.amount < before.amount) {
-      if (new PublicKey(mint).toString() !== USDC) throw new Error(`the swap would take a non-USDC token from ${a}`);
+      if (after.mint !== USDC) throw new Error(`the swap would take a non-USDC token from ${a}`);
       usdcOut += before.amount - after.amount;
     }
   });
   if (usdcOut > maxUsdcAtomic) throw new Error(`the swap would take ${usdcOut} atomic USDC, asked for ${maxUsdcAtomic}`);
+  const gain = (post[0]?.lamports ?? 0) - preSol;
+  if (gain < minSolLamports) throw new Error(`the swap would add only ${gain} lamports, the quote promised at least ${minSolLamports}`);
   return { usdcOut, solGain: ((post[0]?.lamports ?? 0) - preSol) / LAMPORTS };
 }
 
@@ -177,7 +189,9 @@ async function main() {
     if (!best.simulation.gasless?.enabled) fail('gasless is not available for this swap (Swap.io needs SOL < 0.01 and at least $2)');
     say(`best route: ${best.provider.key}, ${best.simulation.primaryOutput.amountFormatted} SOL, network fee sponsored by ${best.simulation.gasless.feePayer}`);
     const t = VersionedTransaction.deserialize(Buffer.from(best.simulation.transaction, 'base64'));
-    const v = await verifySwap(t, me, BigInt(Math.round(usdcIn * 1e6)));
+    // the simulation must deliver at least the quoted SOL minus 2% (slippage 1% plus the gasless cut)
+    const minGain = Math.floor(Number(best.simulation.primaryOutput.amount) * 0.98);
+    const v = await verifySwap(t, me, BigInt(Math.round(usdcIn * 1e6)), minGain);
     console.error(`checked on own RPC: takes ${Number(v.usdcOut) / 1e6} USDC, adds ${v.solGain} SOL, fee paid by sponsor`);
     if (!args.yes) { say('dry run: add --yes to sign and send'); return; }
     t.sign([w]);
