@@ -45,6 +45,6 @@ The skill holds a real key, so it does not trust the server blindly:
 
 ## How it was built
 
-I wrote this with Claude Code as my pair, then ran every command above on mainnet with a real wallet.
+I wrote this with Claude Code as my pair, then ran every command above on mainnet with a real wallet. The payment cap and the pre-sign simulation were run live on mainnet on Nov 10 (receipt https://solscan.io/tx/3VdCQvXofoLWELA9NPPFPFQZ85RcpMD9ncSvzkA7js5SL3ucRtrywYPNtpR9ke9NrCtxmNpfpJ3kZBLSypTiU86V, swap https://solscan.io/tx/45HJ85AzUNrdfdUyWo25WQoMVUqp3pykZ68mUsJMjqZhs3s6feqc1ckUX5o2c6YigHSZ6dti4vD2riFnWjYtnURp). The last extra checks (Token-2022, close authority, durable nonce, minimum SOL) were added after that run and checked by reading the code and a parse test against the live wallet, not by a new swap.
 
 MIT license.
