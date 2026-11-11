@@ -20,7 +20,7 @@ Receipts from the run in the video:
 - x402 payment for the quote: https://solscan.io/tx/5T9oyswt5QP2DJdrMFcP4NiDCSHoEebJpEosJT7xadP6wNxwR51YBdJPDiWLd9mj3wSWvPhNWJkmVnUNTpr8qD1E
 - the gasless swap: https://solscan.io/tx/36vLV6cJdmD8pMUr35hYDNEvJ7X1CzwGBAQpMF6KAfmkmB98JSeVkwkwY8ib5m4t3FVw67aQNghUWdarufhstV39
 
-Video: [link to the X post, added after publishing]
+Video: https://x.com/SirenaMC2/status/2120521900728176920 (write-up on Medium: https://medium.com/@sirenamc2/my-bot-had-dollars-and-zero-sol-x402-and-swap-io-got-it-moving-again-e38829b6cf4d)
 
 Why x402 here and not an API key: the skill is public and runs on other people's machines. A key would have to ship with it or every user would need to sign up. With x402 each install pays for its own calls from its own wallet, fractions of a cent, and nobody holds anyone's key.
 
